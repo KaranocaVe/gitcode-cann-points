@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GitCode CANN 积分按日汇总
 // @namespace    https://github.com/KaranocaVe/gitcode-cann-points
-// @version      1.0.0
-// @description  顺序读取 CANN 积分明细，逐页更新每日及各积分类型的小计。
+// @version      1.1.0
+// @description  打开 CANN 积分明细即显示按日汇总，逐页更新每日及各积分类型的小计。
 // @match        https://gitcode.com/*
 // @run-at       document-start
 // @grant        none
@@ -20,8 +20,10 @@
   const integer = new Intl.NumberFormat('zh-CN');
   const points = new Intl.NumberFormat('zh-CN', { signDisplay: 'exceptZero' });
   const requests = new WeakSet();
-  let authorization;
+  let pendingAuthorization;
   let observer;
+  let active;
+  const modalObserver = new MutationObserver(syncSummary);
 
   // The growth center runs in a same-origin frame. Its ledger XHR supplies the session header.
   // Keep it in this closure and reuse it only for that same endpoint.
@@ -46,12 +48,12 @@
   xhr.setRequestHeader = function (name, value) {
     const result = Reflect.apply(setRequestHeader, this, [name, value]);
     if (requests.has(this) && String(name).toLowerCase() === 'authorization') {
-      authorization = String(value);
+      pendingAuthorization = String(value);
       if (!observer) {
-        observer = new MutationObserver(mountButton);
+        observer = new MutationObserver(syncSummary);
         observer.observe(document, { childList: true, subtree: true });
       }
-      mountButton();
+      syncSummary();
     }
     return result;
   };
@@ -64,28 +66,43 @@
     return node;
   }
 
-  function mountButton() {
-    if (location.pathname !== '/setting/points') {
+  function isOpen(modal) {
+    return modal.isConnected && !modal.classList.contains('devui-modal--wipe-leave-active');
+  }
+
+  function syncSummary() {
+    const onPointsPage = location.pathname === '/setting/points';
+    if (active && (!onPointsPage || !isOpen(active.modal))) {
+      active.cancel.abort();
+      modalObserver.disconnect();
+      active = undefined;
+    }
+    if (!onPointsPage) {
       observer?.disconnect();
       observer = undefined;
-      authorization = undefined;
+      pendingAuthorization = undefined;
       return;
     }
+    if (active || !pendingAuthorization) return;
+
     for (const modal of document.querySelectorAll('.points-modal')) {
-      if (modal.querySelector('.gc-cann-launch')) continue;
+      if (!isOpen(modal) || modal.classList.contains('gc-cann-summary-modal')) continue;
       const title = modal.querySelector('.devui-modal__header')?.textContent.trim();
       const body = modal.querySelector('.devui-modal__body');
       if (!body || !/CANN.*(?:积分.*明细|points.*details)/i.test(title ?? '')) continue;
+      const authorization = pendingAuthorization;
+      pendingAuthorization = undefined;
+      const cancel = new AbortController();
+      active = { modal, cancel };
+      modalObserver.observe(modal, { attributes: true, attributeFilter: ['class'] });
       installStyle();
-      const toolbar = element('div', 'gc-cann-toolbar');
-      const button = element('button', 'gc-cann-launch', '按日汇总');
-      button.addEventListener('click', showSummary);
-      toolbar.append(button);
-      body.prepend(toolbar);
+      modal.classList.add('gc-cann-summary-modal');
+      mountSummary(body, authorization, cancel.signal);
+      return;
     }
   }
 
-  async function fetchPage(page, signal) {
+  async function fetchPage(page, authorization, signal) {
     const url = new URL(endpoint);
     url.search = new URLSearchParams({ score_type: 'CANN', page, per_page: pageSize });
     const response = await request(url, {
@@ -196,29 +213,16 @@
     daily.categoriesNode.replaceChildren(...rows);
   }
 
-  function showSummary() {
-    const cancel = new AbortController();
-    const dialog = element('dialog', 'gc-cann-dialog');
-    dialog.setAttribute('aria-labelledby', 'gc-cann-title');
-    const heading = element('h2', '', 'CANN 积分按日汇总');
-    heading.id = 'gc-cann-title';
-    const close = element('button', 'gc-cann-close', '关闭');
-    close.addEventListener('click', () => dialog.close());
-    const header = element('header', 'gc-cann-header');
-    header.append(heading, close);
+  function mountSummary(body, authorization, signal) {
+    const panel = element('div', 'gc-cann-panel');
     const status = element('p', 'gc-cann-status');
     status.setAttribute('role', 'status');
-    const retry = element('button', 'gc-cann-launch', '重试');
-    const footer = element('footer', 'gc-cann-footer');
-    footer.append(status, retry);
+    const retry = element('button', 'gc-cann-retry', '重试');
+    const toolbar = element('div', 'gc-cann-toolbar');
+    toolbar.append(status, retry);
     const list = element('div', 'gc-cann-list');
-    dialog.append(header, list, footer);
-    dialog.addEventListener('close', () => {
-      cancel.abort();
-      dialog.remove();
-    }, { once: true });
-    document.body.append(dialog);
-    dialog.showModal();
+    panel.append(toolbar, list);
+    body.append(panel);
 
     const days = new Map();
     let page = 1;
@@ -241,8 +245,8 @@
       status.textContent = page === 1 ? '正在读取第 1 页…' : progress();
       try {
         do {
-          const data = await fetchPage(page, cancel.signal);
-          if (cancel.signal.aborted || !dialog.open) return;
+          const data = await fetchPage(page, authorization, signal);
+          if (signal.aborted || !panel.isConnected) return;
           total ??= data.total;
           if (data.total !== total || data.content.length !== Math.min(pageSize, total - read)) {
             restart = true;
@@ -254,7 +258,7 @@
           status.textContent = progress();
         } while (read < total);
       } catch (error) {
-        if (cancel.signal.aborted || !dialog.open) return;
+        if (signal.aborted || !panel.isConnected) return;
         status.textContent = `第 ${page} 页读取失败 · ${error.message} · 已汇总 ${integer.format(read)} 笔`;
         retry.textContent = restart ? '重新读取' : '重试本页';
         retry.hidden = false;
@@ -274,55 +278,36 @@
     const style = element('style');
     style.id = 'gc-cann-style';
     style.textContent = `
-      .gc-cann-toolbar { display: flex; justify-content: flex-end; margin-bottom: 8px; }
-      .gc-cann-launch, .gc-cann-close {
-        padding: 6px 12px;
-        border: 1px solid #6b7280;
-        border-radius: 5px;
-        font: inherit;
-        cursor: pointer;
+      .points-modal.gc-cann-summary-modal { max-width: calc(100vw - 24px); }
+      .gc-cann-summary-modal > .devui-modal__body > :not(.gc-cann-panel) { display: none !important; }
+      .gc-cann-panel {
+        display: grid;
+        grid-template-rows: auto minmax(0, 1fr);
+        height: clamp(140px, calc(100dvh - 130px), 520px);
+        font-size: 14px;
       }
-      .gc-cann-launch { color: #fff; background: #2458c5; border-color: #2458c5; }
-      .gc-cann-launch:hover { background: #1c479f; }
-      .gc-cann-close { color: inherit; background: transparent; }
-      .gc-cann-dialog {
-        box-sizing: border-box;
-        position: fixed;
-        inset: 0;
-        margin: auto;
-        width: min(660px, calc(100vw - 32px));
-        height: min(650px, calc(100dvh - 36px));
-        max-width: none;
-        max-height: none;
-        padding: 0;
-        color-scheme: light dark;
-        color: CanvasText;
-        background: Canvas;
-        border: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
-        border-radius: 10px;
-        font: 14px/1.45 system-ui, sans-serif;
-        box-shadow: 0 12px 46px #0004;
-        overflow: hidden;
-      }
-      .gc-cann-dialog[open] { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
-      .gc-cann-dialog::backdrop { background: #12152778; }
-      .gc-cann-header, .gc-cann-footer {
+      .gc-cann-toolbar {
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 12px;
-        padding: 12px 18px;
-        border-color: color-mix(in srgb, CanvasText 16%, transparent);
-        border-style: solid;
-        border-width: 0;
+        padding: 0 0 12px;
+        border-bottom: 1px solid color-mix(in srgb, currentColor 16%, transparent);
       }
-      .gc-cann-header { border-bottom-width: 1px; }
-      .gc-cann-header h2 { margin: 0; font-size: 17px; font-weight: 650; color: inherit; }
-      .gc-cann-footer { border-top-width: 1px; }
-      .gc-cann-footer button { flex: none; }
+      .gc-cann-retry {
+        flex: none;
+        padding: 6px 12px;
+        border: 1px solid #2458c5;
+        border-radius: 5px;
+        color: #fff;
+        background: #2458c5;
+        font: inherit;
+        cursor: pointer;
+      }
+      .gc-cann-retry:hover { background: #1c479f; }
       .gc-cann-status { margin: 0; font-size: 13px; color: inherit; }
-      .gc-cann-list { overflow: auto; overscroll-behavior: contain; padding: 0 18px; }
-      .gc-cann-day { border-bottom: 1px solid color-mix(in srgb, CanvasText 13%, transparent); }
+      .gc-cann-list { overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+      .gc-cann-day { border-bottom: 1px solid color-mix(in srgb, currentColor 13%, transparent); }
       .gc-cann-day:last-child { border-bottom: 0; }
       .gc-cann-day-summary, .gc-cann-category {
         display: grid;
@@ -331,7 +316,7 @@
         align-items: baseline;
         font-variant-numeric: tabular-nums;
       }
-      .gc-cann-day-summary { padding: 10px 0; cursor: pointer; list-style: none; }
+      .gc-cann-day-summary { padding: 10px 8px 10px 2px; cursor: pointer; list-style: none; }
       .gc-cann-day-summary::-webkit-details-marker { display: none; }
       .gc-cann-day-summary > span:first-child::before {
         content: '▸';
@@ -339,7 +324,7 @@
         width: 1.35em;
       }
       .gc-cann-day[open] > summary > span:first-child::before { content: '▾'; }
-      .gc-cann-categories { margin: 0 0 8px; padding: 0 0 0 1.35em; list-style: none; }
+      .gc-cann-categories { margin: 0 0 8px; padding: 0 8px 0 calc(1.35em + 2px); list-style: none; }
       .gc-cann-category { padding: 5px 0; overflow-wrap: anywhere; }
       .gc-cann-count { opacity: .72; white-space: nowrap; }
       .gc-cann-amount { text-align: right; white-space: nowrap; }
