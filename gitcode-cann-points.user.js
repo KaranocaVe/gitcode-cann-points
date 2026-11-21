@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitCode CANN 积分按日汇总
 // @namespace    https://github.com/KaranocaVe/gitcode-cann-points
-// @version      1.1.0
+// @version      1.1.1
 // @description  打开 CANN 积分明细即显示按日汇总，逐页更新每日及各积分类型的小计。
 // @match        https://gitcode.com/*
 // @run-at       document-start
@@ -20,13 +20,31 @@
   const integer = new Intl.NumberFormat('zh-CN');
   const points = new Intl.NumberFormat('zh-CN', { signDisplay: 'exceptZero' });
   const requests = new WeakSet();
-  let pendingAuthorization;
+  let authorization;
   let observer;
   let active;
   const modalObserver = new MutationObserver(syncSummary);
 
-  // The growth center runs in a same-origin frame. Its ledger XHR supplies the session header.
-  // Keep it in this closure and reuse it only for that same endpoint.
+  // Capture the authorization from the page's own CANN ledger request. Keep it only
+  // in memory, and reuse it only for the same endpoint. Do not depend on the current
+  // route: the request may be issued by a frame or during an SPA transition.
+  function isLedgerRequest(method, url) {
+    if (String(method).toUpperCase() !== 'GET') return false;
+    try {
+      const target = new URL(url, location.href);
+      return target.origin === endpoint.origin && target.pathname === endpoint.pathname
+        && target.searchParams.get('score_type') === 'CANN';
+    } catch {
+      return false;
+    }
+  }
+
+  function captureAuthorization(value) {
+    if (typeof value !== 'string' || !value.trim()) return;
+    authorization = value;
+    syncSummary();
+  }
+
   const xhr = XMLHttpRequest.prototype;
   const open = xhr.open;
   const setRequestHeader = xhr.setRequestHeader;
@@ -34,29 +52,48 @@
   xhr.open = function (method, url, ...options) {
     const result = Reflect.apply(open, this, [method, url, ...options]);
     requests.delete(this);
-    if (location.pathname !== '/setting/points' || String(method).toUpperCase() !== 'GET') {
-      return result;
-    }
-    const request = new URL(url, location.href);
-    if (request.origin === endpoint.origin && request.pathname === endpoint.pathname
-        && request.searchParams.get('score_type') === 'CANN') {
-      requests.add(this);
-    }
+    if (isLedgerRequest(method, url)) requests.add(this);
     return result;
   };
 
   xhr.setRequestHeader = function (name, value) {
     const result = Reflect.apply(setRequestHeader, this, [name, value]);
     if (requests.has(this) && String(name).toLowerCase() === 'authorization') {
-      pendingAuthorization = String(value);
-      if (!observer) {
-        observer = new MutationObserver(syncSummary);
-        observer.observe(document, { childList: true, subtree: true });
-      }
-      syncSummary();
+      captureAuthorization(String(value));
     }
     return result;
   };
+
+  // Some site versions use fetch instead of XMLHttpRequest.
+  const nativeFetch = window.fetch;
+  window.fetch = function (input, init) {
+    try {
+      const url = typeof input === 'string' || input instanceof URL ? input : input?.url;
+      const method = init?.method ?? input?.method ?? 'GET';
+      if (isLedgerRequest(method, url)) {
+        const headers = init?.headers ?? input?.headers;
+        if (headers) captureAuthorization(new Headers(headers).get('authorization'));
+      }
+    } catch {
+      // Instrumentation must never break the website's own requests.
+    }
+    return Reflect.apply(nativeFetch, this, [input, init]);
+  };
+
+  // Start DOM observation on entry to the page, not only after an API request.
+  // pushState/replaceState do not trigger popstate in single-page applications.
+  for (const method of ['pushState', 'replaceState']) {
+    const original = history[method];
+    history[method] = function (...args) {
+      const result = Reflect.apply(original, this, args);
+      syncSummary();
+      return result;
+    };
+  }
+  window.addEventListener('popstate', syncSummary);
+  window.addEventListener('pageshow', syncSummary);
+  document.addEventListener('DOMContentLoaded', syncSummary, { once: true });
+  syncSummary();
 
   function element(tag, className, text) {
     const node = document.createElement(tag);
@@ -71,33 +108,38 @@
   }
 
   function syncSummary() {
-    const onPointsPage = location.pathname === '/setting/points';
-    if (active && (!onPointsPage || !isOpen(active.modal))) {
+    const onPointsPage = /^\/setting\/points\/?$/.test(location.pathname);
+    if (onPointsPage && !observer) {
+      observer = new MutationObserver(syncSummary);
+      observer.observe(document, { childList: true, subtree: true });
+    }
+    if (active && (!onPointsPage || !isOpen(active.modal) || !active.panel.isConnected)) {
       active.cancel.abort();
       modalObserver.disconnect();
+      active.modal.classList.remove('gc-cann-summary-modal');
       active = undefined;
     }
     if (!onPointsPage) {
       observer?.disconnect();
       observer = undefined;
-      pendingAuthorization = undefined;
       return;
     }
-    if (active || !pendingAuthorization) return;
+    if (active || !authorization) return;
 
     for (const modal of document.querySelectorAll('.points-modal')) {
       if (!isOpen(modal) || modal.classList.contains('gc-cann-summary-modal')) continue;
-      const title = modal.querySelector('.devui-modal__header')?.textContent.trim();
+      const title = modal.querySelector('.devui-modal__header')?.textContent.trim() ?? '';
       const body = modal.querySelector('.devui-modal__body');
-      if (!body || !/CANN.*(?:积分.*明细|points.*details)/i.test(title ?? '')) continue;
-      const authorization = pendingAuthorization;
-      pendingAuthorization = undefined;
+      const isDetails = /积分.{0,8}(?:明细|记录)|(?:points?|score).{0,16}(?:details?|records?|history)/i.test(title);
+      const isCann = /CANN/i.test(title)
+        || new URLSearchParams(location.search).get('tid')?.toLowerCase() === 'cann';
+      if (!body || !isDetails || !isCann) continue;
       const cancel = new AbortController();
-      active = { modal, cancel };
-      modalObserver.observe(modal, { attributes: true, attributeFilter: ['class'] });
       installStyle();
       modal.classList.add('gc-cann-summary-modal');
-      mountSummary(body, authorization, cancel.signal);
+      const panel = mountSummary(body, authorization, cancel.signal);
+      active = { modal, panel, cancel };
+      modalObserver.observe(modal, { attributes: true, attributeFilter: ['class'] });
       return;
     }
   }
@@ -231,6 +273,7 @@
     let restart = false;
     retry.addEventListener('click', load);
     void load();
+    return panel;
 
     async function load() {
       retry.hidden = true;
